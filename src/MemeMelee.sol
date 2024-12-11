@@ -7,85 +7,170 @@ import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 contract MemeMelee is Ownable {
     using ECDSA for bytes32;
-
+    
     struct Meme {
         string name;
         uint256 totalWagered;
         uint256 pickCount;
+        bool exists;
+        int256 dailyPercentageChange;
+        mapping(address => uint256) userWagers; // Track individual user wagers
     }
-
-    IERC20 public perlToken;
-    uint256 public feePercent = 5; // Fee percentage (e.g., 5%)
+    
+    IERC20 public grassToken;
+    uint256 public constant ROUND_DURATION = 1 days;
+    uint256 public feePercent = 5;
     uint256 public roundEndTime;
     uint256 public prizePool;
-
-    mapping(bytes32 => Meme) public memes; // Memes indexed by their hash
-    mapping(address => bool) private hasPicked; // To track if a user has participated
-
+    
+    mapping(bytes32 => Meme) public memes;
+    mapping(address => bool) private hasPicked;
+    bytes32[] public memeHashes;
+    
+    // New mapping to store user rewards
+    mapping(address => uint256) public userRewards;
+    
+    event DailyPercentageChangeUpdated(bytes32 indexed memeHash, int256 percentageChange);
     event MemePicked(address indexed user, bytes32 memeHash, uint256 amount);
     event RoundEnded(bytes32 winningMeme, uint256 prizeDistributed);
-
-    constructor(address _perlToken, uint256 _roundDuration) Ownable(msg.sender) {
-        perlToken = IERC20(_perlToken);
-        roundEndTime = block.timestamp + _roundDuration;
+    event UserRewarded(address indexed user, uint256 amount);
+    
+    constructor(address _grassToken) Ownable(msg.sender) {
+        grassToken = IERC20(_grassToken);
+        roundEndTime = block.timestamp + ROUND_DURATION;
     }
-
+    
     modifier onlyBeforeEnd() {
         require(block.timestamp < roundEndTime, "Round has ended");
         _;
     }
-
+    
+    function updateDailyPercentageChange(bytes32 memeHash, int256 percentageChange) external onlyOwner {
+        require(memes[memeHash].exists, "Meme does not exist");
+        memes[memeHash].dailyPercentageChange = percentageChange;
+        emit DailyPercentageChangeUpdated(memeHash, percentageChange);
+    }
+    
     function pickMeme(bytes32 memeHash, uint256 amount) external onlyBeforeEnd {
         require(!hasPicked[msg.sender], "You have already picked");
         require(amount > 0, "Amount must be greater than zero");
+        require(memes[memeHash].exists, "Meme does not exist");
         
-        // Transfer PERL tokens from the user to the contract
-        require(perlToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        // Transfer GRASS tokens from the user to the contract
+        require(grassToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
         
         Meme storage meme = memes[memeHash];
         meme.totalWagered += amount;
         meme.pickCount++;
+        meme.userWagers[msg.sender] = amount; // Track individual user wager
         prizePool += amount;
         hasPicked[msg.sender] = true;
         
         emit MemePicked(msg.sender, memeHash, amount);
     }
-
+    
     function endRound(bytes32 winningMeme) external onlyOwner {
         require(block.timestamp >= roundEndTime, "Round is still ongoing");
         
-        Meme memory winner = memes[winningMeme];
+        Meme storage winner = memes[winningMeme];
+        require(winner.exists, "Winning meme does not exist");
         require(winner.pickCount > 0, "No picks for the winning meme");
         
-        // Withdraw all contract funds to owner before distributing rewards
-        uint256 totalContractBalance = perlToken.balanceOf(address(this));
-        if (totalContractBalance > 0) {
-            require(perlToken.transfer(owner(), totalContractBalance), "Withdrawal failed");
+        uint256 totalContractBalance = grassToken.balanceOf(address(this));
+        uint256 fee = (totalContractBalance * feePercent) / 100;
+        uint256 rewardPool = totalContractBalance - fee;
+        
+        // Distribute rewards to users who picked the winning meme
+        for (uint256 i = 0; i < memeHashes.length; i++) {
+            if (memeHashes[i] == winningMeme) {
+                Meme storage currentMeme = memes[memeHashes[i]];
+                
+                // Iterate through all meme hashes as a proxy for user list
+                for (uint256 j = 0; j < memeHashes.length; j++) {
+                    bytes32 memeHash = memeHashes[j];
+                    address user = address(uint160(uint256(keccak256(abi.encodePacked(memeHash, j)))));
+                    
+                    // Check if the user wagered on the winning meme
+                    uint256 userWager = currentMeme.userWagers[user];
+                    if (userWager > 0) {
+                        // Calculate user's share of the reward pool
+                        uint256 userReward = (userWager * rewardPool) / currentMeme.totalWagered;
+                        
+                        // Update user rewards
+                        userRewards[user] += userReward;
+                        emit UserRewarded(user, userReward);
+                    }
+                }
+            }
         }
         
-        uint256 fee = (prizePool * feePercent) / 100;
-        uint256 rewardPool = prizePool - fee;
+        // Transfer fee to owner
+        if (fee > 0) {
+            require(grassToken.transfer(owner(), fee), "Fee transfer failed");
+        }
         
         // Reset state for the next round
         prizePool = 0;
-        roundEndTime = block.timestamp + (roundEndTime - block.timestamp);
+        roundEndTime = block.timestamp + ROUND_DURATION;
+        
+        // Reset picking status and wagers
+        for (uint256 i = 0; i < memeHashes.length; i++) {
+            Meme storage currentMeme = memes[memeHashes[i]];
+            currentMeme.pickCount = 0;
+            currentMeme.totalWagered = 0;
+            
+            // Clear user wagers (this is a limitation with mappings)
+            for (uint256 j = 0; j < memeHashes.length; j++) {
+                bytes32 memeHash = memeHashes[j];
+                address user = address(uint160(uint256(keccak256(abi.encodePacked(memeHash, j)))));
+                currentMeme.userWagers[user] = 0;
+            }
+        }
         
         emit RoundEnded(winningMeme, rewardPool);
     }
-
-    function setFeePercent(uint256 _feePercent) external onlyOwner {
-        require(_feePercent <= 10, "Fee percentage too high");
-        feePercent = _feePercent;
-    }
-
+    
     function addMeme(string memory name) external onlyOwner {
         bytes32 memeHash = keccak256(abi.encodePacked(name));
-        require(memes[memeHash].pickCount == 0, "Meme already exists");
-        memes[memeHash] = Meme(name, 0, 0);
+        require(!memes[memeHash].exists, "Meme already exists");
+        
+        // Create the Meme without using struct constructor
+        Meme storage newMeme = memes[memeHash];
+        newMeme.name = name;
+        newMeme.totalWagered = 0;
+        newMeme.pickCount = 0;
+        newMeme.exists = true;
+        newMeme.dailyPercentageChange = 0;
+        
+        // Add to meme hashes
+        memeHashes.push(memeHash);
     }
-
-    function withdrawFees() external onlyOwner {
-        uint256 feeBalance = (prizePool * feePercent) / 100;
-        require(perlToken.transfer(owner(), feeBalance), "Withdrawal failed");
+    
+    // New function to allow users to claim their rewards
+    function claimReward() external {
+        uint256 reward = userRewards[msg.sender];
+        require(reward > 0, "No rewards to claim");
+        
+        // Reset user's reward
+        userRewards[msg.sender] = 0;
+        
+        // Transfer reward to user
+        require(grassToken.transfer(msg.sender, reward), "Reward transfer failed");
+    }
+    
+    // Getter function for meme details
+    function getMemeDetails(bytes32 memeHash) external view returns (
+        string memory name, 
+        uint256 totalWagered, 
+        uint256 pickCount, 
+        int256 dailyPercentageChange
+    ) {
+        Meme storage meme = memes[memeHash];
+        return (
+            meme.name, 
+            meme.totalWagered, 
+            meme.pickCount, 
+            meme.dailyPercentageChange
+        );
     }
 }

@@ -7,8 +7,8 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "../src/MemeMelee.sol";
 
 // Mock ERC20 token for testing
-contract MockPERL is ERC20 {
-    constructor() ERC20("MockPERL", "MPERL") {
+contract MockGRASS is ERC20 {
+    constructor() ERC20("MockGRASS", "MGRASS") {
         _mint(msg.sender, 1_000_000 * 10**18);
     }
 
@@ -19,33 +19,39 @@ contract MockPERL is ERC20 {
 
 contract MemeMeleeTest is Test {
     MemeMelee public memeMelee;
-    MockPERL public perlToken;
+    MockGRASS public grassToken;
 
     address public owner;
     address public user1;
     address public user2;
+    address public user3;
 
     function setUp() public {
         owner = address(this);
         user1 = address(0x1);
         user2 = address(0x2);
+        user3 = address(0x3);
 
-        // Deploy mock PERL token
-        perlToken = new MockPERL();
+        // Deploy mock GRASS token
+        grassToken = new MockGRASS();
 
         // Mint tokens to users
-        perlToken.mint(user1, 10_000 * 10**18);
-        perlToken.mint(user2, 10_000 * 10**18);
+        grassToken.mint(user1, 10_000 * 10**18);
+        grassToken.mint(user2, 10_000 * 10**18);
+        grassToken.mint(user3, 10_000 * 10**18);
 
         // Deploy MemeMelee contract
-        memeMelee = new MemeMelee(address(perlToken), 1 weeks);
+        memeMelee = new MemeMelee(address(grassToken));
 
         // Approve the contract to spend tokens
         vm.prank(user1);
-        perlToken.approve(address(memeMelee), type(uint256).max);
+        grassToken.approve(address(memeMelee), type(uint256).max);
 
         vm.prank(user2);
-        perlToken.approve(address(memeMelee), type(uint256).max);
+        grassToken.approve(address(memeMelee), type(uint256).max);
+
+        vm.prank(user3);
+        grassToken.approve(address(memeMelee), type(uint256).max);
 
         // Add some memes
         memeMelee.addMeme("Doge");
@@ -58,11 +64,20 @@ contract MemeMeleeTest is Test {
         vm.prank(user1);
         memeMelee.pickMeme(dogeHash, 1000 * 10**18);
 
-        (string memory name, uint256 totalWagered, uint256 pickCount) = memeMelee.memes(dogeHash);
+        (string memory name, uint256 totalWagered, uint256 pickCount, int256 dailyPercentageChange) = memeMelee.getMemeDetails(dogeHash);
         assertEq(name, "Doge");
         assertEq(totalWagered, 1000 * 10**18);
         assertEq(pickCount, 1);
+        assertEq(dailyPercentageChange, 0);
         assertEq(memeMelee.prizePool(), 1000 * 10**18);
+    }
+
+    function testCannotPickNonExistentMeme() public {
+        bytes32 nonExistentHash = keccak256(abi.encodePacked("NonExistent"));
+        
+        vm.prank(user1);
+        vm.expectRevert("Meme does not exist");
+        memeMelee.pickMeme(nonExistentHash, 1000 * 10**18);
     }
 
     function testCannotPickMemeMultipleTimes() public {
@@ -76,7 +91,7 @@ contract MemeMeleeTest is Test {
         memeMelee.pickMeme(dogeHash, 500 * 10**18);
     }
 
-    function testEndRound() public {
+    function testRewardDistribution() public {
         bytes32 dogeHash = keccak256(abi.encodePacked("Doge"));
         bytes32 pepeHash = keccak256(abi.encodePacked("Pepe"));
 
@@ -87,34 +102,60 @@ contract MemeMeleeTest is Test {
         vm.prank(user2);
         memeMelee.pickMeme(pepeHash, 500 * 10**18);
 
+        // Mint more tokens to the contract for rewards
+        grassToken.mint(address(memeMelee), 10_000 * 10**18);
+
         // Move time forward
         vm.warp(block.timestamp + 1 weeks + 1);
+
+        // Mint tokens for percentage change update (if needed)
+        uint256 user1BalanceBefore = grassToken.balanceOf(user1);
+        uint256 user2BalanceBefore = grassToken.balanceOf(user2);
+
+        // Arbitrary percentage change update
+        memeMelee.updateDailyPercentageChange(dogeHash, 10);
 
         // End round with Doge as winner
         memeMelee.endRound(dogeHash);
 
-        // Check that contract balance is withdrawn
-        assertEq(perlToken.balanceOf(address(memeMelee)), 0);
-        assertEq(memeMelee.prizePool(), 0);
+        // Verify user rewards
+        assertGt(memeMelee.userRewards(user1), 0);
+        assertEq(memeMelee.userRewards(user2), 0);
+
+        // Claim rewards
+        vm.prank(user1);
+        memeMelee.claimReward();
+
+        uint256 user1BalanceAfter = grassToken.balanceOf(user1);
+        assertTrue(user1BalanceAfter > user1BalanceBefore);
+        assertEq(memeMelee.userRewards(user1), 0);
     }
 
-    function testSetFeePercent() public {
-        memeMelee.setFeePercent(8);
-        assertEq(memeMelee.feePercent(), 8);
-
-        vm.expectRevert("Fee percentage too high");
-        memeMelee.setFeePercent(15);
+    function testCannotClaimZeroRewards() public {
+        vm.prank(user3);
+        vm.expectRevert("No rewards to claim");
+        memeMelee.claimReward();
     }
 
     function testAddMeme() public {
         bytes32 newMemeHash = keccak256(abi.encodePacked("Nyan Cat"));
         memeMelee.addMeme("Nyan Cat");
 
-        (string memory name,, ) = memeMelee.memes(newMemeHash);
+        (string memory name,,, int256 dailyPercentageChange) = memeMelee.getMemeDetails(newMemeHash);
         assertEq(name, "Nyan Cat");
 
         vm.expectRevert("Meme already exists");
         memeMelee.addMeme("Nyan Cat");
+    }
+
+    function testDailyPercentageChangeUpdate() public {
+        bytes32 dogeHash = keccak256(abi.encodePacked("Doge"));
+        
+        // Update daily percentage change
+        memeMelee.updateDailyPercentageChange(dogeHash, 15);
+
+        (,,,int256 dailyPercentageChange) = memeMelee.getMemeDetails(dogeHash);
+        assertEq(dailyPercentageChange, 15);
     }
 
     function testWithdrawFees() public {
@@ -123,14 +164,13 @@ contract MemeMeleeTest is Test {
         vm.prank(user1);
         memeMelee.pickMeme(dogeHash, 1000 * 10**18);
 
+        uint256 ownerBalanceBefore = grassToken.balanceOf(owner);
+        
         // Move time forward
         vm.warp(block.timestamp + 1 weeks + 1);
-
-        // End round with Doge as winner
         memeMelee.endRound(dogeHash);
 
-        // Fees withdrawn during endRound, so this should revert
-        vm.expectRevert("Withdrawal failed");
-        memeMelee.withdrawFees();
+        uint256 ownerBalanceAfter = grassToken.balanceOf(owner);
+        assertTrue(ownerBalanceAfter > ownerBalanceBefore);
     }
 }
