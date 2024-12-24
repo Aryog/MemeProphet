@@ -4,9 +4,8 @@ out = "out"
 libs = ["lib"]
 
 [profile.zksync]
-src = 'src'
-libs = ['lib']
-solc-version = "0.8.24"
-fallback_oz = true
-is_system = false
-mode = "3"
+src = "src"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.24"
+eth_rpc_url = "https://rpc.testnet.lens.dev"

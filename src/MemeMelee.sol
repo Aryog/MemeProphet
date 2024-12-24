@@ -1,6 +1,5 @@
-
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.18;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -14,9 +13,10 @@ contract MemeMelee is Ownable {
         uint256 totalWagered;
         uint256 pickCount;
         bool exists;
-        uint256 openPrice;  // New: Opening price
-        uint256 closePrice; // New: Closing price
-        mapping(address => uint256) userWagers; // Track individual user wagers
+        uint256 openPrice;
+        uint256 closePrice;
+        mapping(address => uint256) userWagers;
+        address[] userList; // Array to track users who wagered
     }
 
     IERC20 public grassToken;
@@ -27,40 +27,71 @@ contract MemeMelee is Ownable {
 
     mapping(bytes32 => Meme) public memes;
     mapping(address => bool) private hasPicked;
-    bytes32[] public memeHashes;
-
-    // New mapping to store user rewards
     mapping(address => uint256) public userRewards;
+    bytes32[] public memeHashes;
+    
+    // Track active round
+    uint256 public currentRound;
+    bool public roundActive;
 
     event MemePicked(address indexed user, bytes32 memeHash, uint256 amount);
     event RoundEnded(bytes32 winningMeme, uint256 prizeDistributed);
     event UserRewarded(address indexed user, uint256 amount);
     event MemePriceSet(bytes32 indexed memeHash, uint256 openPrice, uint256 closePrice);
+    event NewRoundStarted(uint256 indexed roundNumber, uint256 startTime, uint256 endTime);
 
     constructor(address _grassToken) Ownable(msg.sender) {
         grassToken = IERC20(_grassToken);
-        roundEndTime = block.timestamp + ROUND_DURATION;
+        startNewRound();
     }
 
-    modifier onlyBeforeEnd() {
+    function startNewRound() public {
+        require(!roundActive || block.timestamp >= roundEndTime, "Current round still active");
+        
+        roundEndTime = block.timestamp + ROUND_DURATION;
+        currentRound++;
+        roundActive = true;
+        prizePool = 0;
+
+        // Reset all user picks for the new round
+        for (uint256 i = 0; i < memeHashes.length; i++) {
+            bytes32 memeHash = memeHashes[i];
+            Meme storage meme = memes[memeHash];
+            
+            // Reset meme stats
+            meme.totalWagered = 0;
+            meme.pickCount = 0;
+            
+            // Clear user wagers
+            for (uint256 j = 0; j < meme.userList.length; j++) {
+                address user = meme.userList[j];
+                delete meme.userWagers[user];
+                delete hasPicked[user]; // Reset user picks for new round
+            }
+            delete meme.userList;
+        }
+
+        emit NewRoundStarted(currentRound, block.timestamp, roundEndTime);
+    }
+
+    modifier onlyDuringRound() {
+        require(roundActive, "No active round");
         require(block.timestamp < roundEndTime, "Round has ended");
         _;
     }
 
-    
-
-    function pickMeme(bytes32 memeHash, uint256 amount) external onlyBeforeEnd {
-        require(!hasPicked[msg.sender], "You have already picked");
-        require(amount > 0, "Amount must be greater than zero");
+    function pickMeme(bytes32 memeHash, uint256 amount) external onlyDuringRound {
+        require(!hasPicked[msg.sender], "Already picked this round");
+        require(amount >= 1e15, "Minimum wager is 0.001 GRASS");
         require(memes[memeHash].exists, "Meme does not exist");
 
-        // Transfer GRASS tokens from the user to the contract
         require(grassToken.transferFrom(msg.sender, address(this), amount), "Transfer failed");
 
         Meme storage meme = memes[memeHash];
         meme.totalWagered += amount;
         meme.pickCount++;
-        meme.userWagers[msg.sender] = amount; // Track individual user wager
+        meme.userWagers[msg.sender] = amount;
+        meme.userList.push(msg.sender);
         prizePool += amount;
         hasPicked[msg.sender] = true;
 
@@ -68,40 +99,27 @@ contract MemeMelee is Ownable {
     }
 
     function endRound(bytes32 winningMeme) external onlyOwner {
-        require(block.timestamp >= roundEndTime, "Round is still ongoing");
+        require(roundActive, "No active round");
+        require(block.timestamp >= roundEndTime, "Round still ongoing");
+        require(memes[winningMeme].exists && memes[winningMeme].pickCount > 0, "Invalid winning meme");
 
         Meme storage winner = memes[winningMeme];
-        require(winner.exists, "Winning meme does not exist");
-        require(winner.pickCount > 0, "No picks for the winning meme");
-
-        // Set the closing price
         _setClosePrice(winningMeme);
 
-        uint256 totalContractBalance = grassToken.balanceOf(address(this));
-        uint256 fee = (totalContractBalance * feePercent) / 100;
-        uint256 rewardPool = totalContractBalance - fee;
+        uint256 totalBalance = grassToken.balanceOf(address(this));
+        require(totalBalance >= prizePool, "Insufficient contract balance");
 
-        // Distribute rewards to users who picked the winning meme
-        for (uint256 i = 0; i < memeHashes.length; i++) {
-            if (memeHashes[i] == winningMeme) {
-                Meme storage currentMeme = memes[memeHashes[i]];
+        uint256 fee = (prizePool * feePercent) / 100;
+        uint256 rewardPool = prizePool - fee;
 
-                // Iterate through all meme hashes as a proxy for user list
-                for (uint256 j = 0; j < memeHashes.length; j++) {
-                    bytes32 memeHash = memeHashes[j];
-                    address user = address(uint160(uint256(keccak256(abi.encodePacked(memeHash, j)))));
-
-                    // Check if the user wagered on the winning meme
-                    uint256 userWager = currentMeme.userWagers[user];
-                    if (userWager > 0) {
-                        // Calculate user's share of the reward pool
-                        uint256 userReward = (userWager * rewardPool) / currentMeme.totalWagered;
-
-                        // Update user rewards
-                        userRewards[user] += userReward;
-                        emit UserRewarded(user, userReward);
-                    }
-                }
+        // Distribute rewards
+        for (uint256 i = 0; i < winner.userList.length; i++) {
+            address user = winner.userList[i];
+            uint256 userWager = winner.userWagers[user];
+            if (userWager > 0) {
+                uint256 userReward = (userWager * rewardPool) / winner.totalWagered;
+                userRewards[user] += userReward; // Fixed: Now properly assigns to user instead of msg.sender
+                emit UserRewarded(user, userReward);
             }
         }
 
@@ -110,26 +128,13 @@ contract MemeMelee is Ownable {
             require(grassToken.transfer(owner(), fee), "Fee transfer failed");
         }
 
-        // Reset state for the next round
-        prizePool = 0;
-        roundEndTime = block.timestamp + ROUND_DURATION;
-
-        // Reset picking status and wagers
-        for (uint256 i = 0; i < memeHashes.length; i++) {
-            Meme storage currentMeme = memes[memeHashes[i]];
-            currentMeme.pickCount = 0;
-            currentMeme.totalWagered = 0;
-
-            // Clear user wagers (this is a limitation with mappings)
-            for (uint256 j = 0; j < memeHashes.length; j++) {
-                bytes32 memeHash = memeHashes[j];
-                address user = address(uint160(uint256(keccak256(abi.encodePacked(memeHash, j)))));
-                currentMeme.userWagers[user] = 0;
-            }
-        }
-
+        roundActive = false;
         emit RoundEnded(winningMeme, rewardPool);
+        
+        // Start new round automatically
+        startNewRound();
     }
+
 
     function addMeme(string memory name, uint256 openPrice) external onlyOwner {
         bytes32 memeHash = keccak256(abi.encodePacked(name));
